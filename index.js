@@ -1,8 +1,43 @@
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "my_secret_token_123";
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 console.log(`Starting Facebook Messenger Webhook Server...`);
+
+// Helper function to get response from Gemini 1.5 Flash API
+async function getGeminiResponse(userText) {
+  if (!GEMINI_API_KEY) {
+    console.error("[Gemini API] Error: GEMINI_API_KEY is not configured.");
+    return "Sorry, my brain is not configured right now.";
+  }
+
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: userText }] }],
+        }),
+      }
+    );
+
+    const data = await response.json();
+    if (response.ok) {
+      const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (reply) {
+        return reply.trim();
+      }
+    }
+    console.error("[Gemini API] Failed to generate content:", JSON.stringify(data));
+  } catch (error) {
+    console.error("[Gemini API] Network error:", error.message);
+  }
+  return "Sorry, I encountered an error while thinking.";
+}
+
 
 // Helper function to send replies via the Facebook Send API
 async function sendTextMessage(recipientId, text) {
@@ -99,8 +134,10 @@ Bun.serve({
 
                     if (message.text) {
                       console.log(`- Text: "${message.text}"`);
-                      // Reply automatically to user messages
-                      sendTextMessage(senderId, "Hello from AI Agent");
+                      // Query Gemini API and reply with the AI response
+                      getGeminiResponse(message.text).then((aiReply) => {
+                        sendTextMessage(senderId, aiReply);
+                      });
                     }
                     if (message.attachments) {
                       console.log(`- Attachments: ${JSON.stringify(message.attachments)}`);
