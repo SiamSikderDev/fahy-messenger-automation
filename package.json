@@ -1,0 +1,10 @@
+{
+  "name": "fahy-messenger-webhook",
+  "version": "1.0.0",
+  "description": "Facebook Messenger Webhook Server using Bun.js",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "bun run index.js"
+  }
+}
