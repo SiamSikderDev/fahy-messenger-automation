@@ -1,7 +1,42 @@
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "my_secret_token_123";
+const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 
 console.log(`Starting Facebook Messenger Webhook Server...`);
+
+// Helper function to send replies via the Facebook Send API
+async function sendTextMessage(recipientId, text) {
+  if (!PAGE_ACCESS_TOKEN) {
+    console.error("[Send API] Error: PAGE_ACCESS_TOKEN is not configured.");
+    return;
+  }
+
+  const payload = {
+    recipient: { id: recipientId },
+    message: { text: text },
+  };
+
+  try {
+    const response = await fetch(
+      `https://graph.facebook.com/v20.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }
+    );
+
+    const data = await response.json();
+    if (response.ok) {
+      console.log(`[Send API] Message sent successfully to ${recipientId}: "${text}"`);
+    } else {
+      console.error(`[Send API] Failed to send message:`, JSON.stringify(data));
+    }
+  } catch (error) {
+    console.error("[Send API] Network error:", error.message);
+  }
+}
+
 
 Bun.serve({
   port: PORT,
@@ -55,13 +90,23 @@ Bun.serve({
                     console.log(`Message Details:`);
                     console.log(`- Sender PSID: ${senderId}`);
                     console.log(`- Recipient Page ID: ${recipientId}`);
+
+                    // Ignore echo messages (sent by the bot itself) to prevent infinite loops
+                    if (message.is_echo) {
+                      console.log(`- Ignoring echo message.`);
+                      return;
+                    }
+
                     if (message.text) {
                       console.log(`- Text: "${message.text}"`);
+                      // Reply automatically to user messages
+                      sendTextMessage(senderId, "Hello from AI Agent");
                     }
                     if (message.attachments) {
                       console.log(`- Attachments: ${JSON.stringify(message.attachments)}`);
                     }
                   }
+
                 });
               }
             });
