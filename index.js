@@ -11,6 +11,23 @@ const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const MONGODB_URI = process.env.MONGODB_URI;
 const OWNER_PSID = process.env.OWNER_PSID;
+const DASHBOARD_USERNAME = process.env.DASHBOARD_USERNAME || "siamsikder175";
+const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "S!@m01889689797";
+
+function checkAuth(req) {
+  const authHeader = req.headers.get("authorization");
+  if (!authHeader || !authHeader.startsWith("Basic ")) {
+    return false;
+  }
+  const base64Credentials = authHeader.split(" ")[1];
+  try {
+    const credentials = atob(base64Credentials);
+    const [username, password] = credentials.split(":");
+    return username === DASHBOARD_USERNAME && password === DASHBOARD_PASSWORD;
+  } catch (e) {
+    return false;
+  }
+}
 
 
 console.log(`Starting Facebook Messenger Webhook Server...`);
@@ -229,9 +246,213 @@ Bun.serve({
     const url = new URL(req.url);
     const path = url.pathname;
 
-    // GET / - Home/Health Check
-    if (path === "/" && req.method === "GET") {
-      return new Response("Facebook Messenger Webhook Server is running!");
+    // --- Dashboard APIs ---
+    if (path.startsWith("/api/dashboard")) {
+      // 1. POST /api/dashboard/login
+      if (path === "/api/dashboard/login" && req.method === "POST") {
+        if (checkAuth(req)) {
+          return new Response(JSON.stringify({ success: true }), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      // 2. GET /api/dashboard/stats
+      if (path === "/api/dashboard/stats" && req.method === "GET") {
+        if (!checkAuth(req)) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), {
+            status: 401,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        try {
+          const totalConversations = await Message.distinct("senderId").then(ids => ids.length);
+          const totalMessages = await Message.countDocuments();
+          const activeLeads = await Lead.countDocuments({ status: { $ne: "completed" } });
+          const completedLeads = await Lead.countDocuments({ status: "completed" });
+          
+          const responseTimes = await Message.find({ responseTimeMs: { $ne: null } }).select("responseTimeMs");
+          let avgResponseTimeMs = 1200;
+          if (responseTimes.length > 0) {
+            const sum = responseTimes.reduce((acc, curr) => acc + curr.responseTimeMs, 0);
+            avgResponseTimeMs = Math.round(sum / responseTimes.length);
+          }
+
+          // Top questions (frequency analysis)
+          const messages = await Message.find({}).select("userMessage");
+          const questionFreq = {};
+          messages.forEach(m => {
+            const text = m.userMessage.trim().toLowerCase().replace(/[?.!]/g, "");
+            if (text.length > 5) {
+              questionFreq[text] = (questionFreq[text] || 0) + 1;
+            }
+          });
+          const topQuestions = Object.entries(questionFreq)
+            .map(([question, count]) => ({ question, count }))
+            .sort((a, b) => b.count - a.count)
+            .slice(0, 5);
+
+          return new Response(
+            JSON.stringify({
+              totalConversations,
+              totalMessages,
+              activeLeads,
+              completedLeads,
+              avgResponseTimeMs,
+              topQuestions,
+            }),
+            { headers: { "Content-Type": "application/json" } }
+          );
+        } catch (err) {
+          return new Response(JSON.stringify({ error: err.message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+
+      // 3. GET /api/dashboard/conversations
+      if (path === "/api/dashboard/conversations" && req.method === "GET") {
+        if (!checkAuth(req)) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), {
+            status: 401,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        try {
+          const messages = await Message.find({}).sort({ timestamp: 1 });
+          const states = await ConversationState.find({});
+          const leads = await Lead.find({});
+
+          const conversationsMap = {};
+          messages.forEach(m => {
+            if (!conversationsMap[m.senderId]) {
+              conversationsMap[m.senderId] = {
+                senderId: m.senderId,
+                messages: [],
+                lastActive: m.timestamp,
+                isHandedOver: false,
+                leadStatus: "none",
+              };
+            }
+            conversationsMap[m.senderId].messages.push({
+              userMessage: m.userMessage,
+              aiResponse: m.aiResponse,
+              timestamp: m.timestamp,
+              responseTimeMs: m.responseTimeMs,
+            });
+            if (m.timestamp > conversationsMap[m.senderId].lastActive) {
+              conversationsMap[m.senderId].lastActive = m.timestamp;
+            }
+          });
+
+          states.forEach(s => {
+            if (conversationsMap[s.senderId]) {
+              conversationsMap[s.senderId].isHandedOver = s.isHandedOver;
+            }
+          });
+
+          leads.forEach(l => {
+            if (conversationsMap[l.senderId]) {
+              conversationsMap[l.senderId].leadStatus = l.status;
+              conversationsMap[l.senderId].leadDetails = {
+                name: l.name,
+                phone: l.phone,
+                email: l.email,
+              };
+            }
+          });
+
+          const conversations = Object.values(conversationsMap).sort(
+            (a, b) => new Date(b.lastActive) - new Date(a.lastActive)
+          );
+
+          return new Response(JSON.stringify(conversations), {
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err) {
+          return new Response(JSON.stringify({ error: err.message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+
+      // 4. POST /api/dashboard/conversations/:senderId/toggle-handoff
+      const toggleHandoffMatch = path.match(/^\/api\/dashboard\/conversations\/([^/]+)\/toggle-handoff$/);
+      if (toggleHandoffMatch && req.method === "POST") {
+        if (!checkAuth(req)) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), {
+            status: 401,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        const targetSenderId = toggleHandoffMatch[1];
+        try {
+          let state = await ConversationState.findOne({ senderId: targetSenderId });
+          if (!state) {
+            state = new ConversationState({ senderId: targetSenderId, isHandedOver: false });
+          }
+          state.isHandedOver = !state.isHandedOver;
+          state.updatedAt = new Date();
+          await state.save();
+
+          return new Response(JSON.stringify({ success: true, isHandedOver: state.isHandedOver }), {
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err) {
+          return new Response(JSON.stringify({ error: err.message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+
+      // 5. GET /api/dashboard/leads
+      if (path === "/api/dashboard/leads" && req.method === "GET") {
+        if (!checkAuth(req)) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), {
+            status: 401,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        try {
+          const leads = await Lead.find({}).sort({ updatedAt: -1 });
+          return new Response(JSON.stringify(leads), {
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err) {
+          return new Response(JSON.stringify({ error: err.message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+
+      // 6. GET /api/dashboard/faqs
+      if (path === "/api/dashboard/faqs" && req.method === "GET") {
+        if (!checkAuth(req)) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), {
+            status: 401,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        try {
+          const faqs = await FAQ.find({}).select("question answer");
+          return new Response(JSON.stringify(faqs), {
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err) {
+          return new Response(JSON.stringify({ error: err.message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
     }
 
     // GET /webhook - Verification
@@ -367,13 +588,15 @@ Bun.serve({
 
                         // Save the conversation details to MongoDB
                         try {
+                          const responseTimeMs = webhookEvent.timestamp ? (Date.now() - webhookEvent.timestamp) : null;
                           const conversationLog = new Message({
                             senderId: senderId,
                             userMessage: message.text,
                             aiResponse: finalReply,
+                            responseTimeMs: responseTimeMs,
                           });
                           await conversationLog.save();
-                          console.log(`[MongoDB] Saved message log for user ${senderId}`);
+                          console.log(`[MongoDB] Saved message log for user ${senderId} with responseTimeMs ${responseTimeMs}`);
                         } catch (dbErr) {
                           console.error(`[MongoDB] Error saving message log:`, dbErr.message);
                         }
@@ -430,6 +653,30 @@ Bun.serve({
       } catch (err) {
         console.error(`[Error] Failed to parse request JSON:`, err.message);
         return new Response("Bad Request", { status: 400 });
+      }
+    }
+
+    // --- Static Serving (SPA fallback) ---
+    if (req.method === "GET") {
+      let filePath = path;
+      if (path === "/" || path === "") {
+        filePath = "/index.html";
+      }
+
+      const absolutePath = `./dashboard/dist${filePath}`;
+      const file = Bun.file(absolutePath);
+      if (await file.exists()) {
+        return new Response(file);
+      }
+      
+      const fallbackFile = Bun.file("./dashboard/dist/index.html");
+      if (await fallbackFile.exists()) {
+        return new Response(fallbackFile);
+      }
+
+      // If nothing built yet, serve the server status message
+      if (path === "/" || path === "") {
+        return new Response("Facebook Messenger Webhook Server is running! Dashboard is not built yet.", { status: 200 });
       }
     }
 
