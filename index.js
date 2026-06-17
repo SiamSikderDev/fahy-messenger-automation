@@ -211,7 +211,7 @@ async function handleLeadCaptureFlow(senderId, text, lead) {
     const ownerId = process.env.OWNER_PSID;
     const notificationText = `🔔 [New Lead Alert]!\nName: ${lead.name}\nPhone: ${lead.phone}\nEmail: ${lead.email}\nSender PSID: ${lead.senderId}`;
     
-    if (ownerId && ownerId !== "your_facebook_user_psid_here") {
+    if (ownerId && ownerId !== "your_facebook_user_psid_here" && senderId !== ownerId) {
       console.log(`[Lead Capture] Notifying owner (${ownerId}) of new lead...`);
       await sendTextMessage(ownerId, notificationText);
     } else {
@@ -322,8 +322,8 @@ Bun.serve({
                         
                         await sendTextMessage(senderId, "I am handing you over to a human agent. They will get back to you shortly.");
                         
-                        // Notify owner
-                        if (OWNER_PSID && OWNER_PSID !== "your_facebook_user_psid_here") {
+                        // Notify owner (only if owner is not the one chatting)
+                        if (OWNER_PSID && OWNER_PSID !== "your_facebook_user_psid_here" && senderId !== OWNER_PSID) {
                           await sendTextMessage(OWNER_PSID, `⚠️ [Handoff Requested] User (PSID: ${senderId}) requested a human agent.\nMessage: "${message.text}"`);
                         }
                         continue;
@@ -387,8 +387,8 @@ Bun.serve({
                           );
                           console.log(`[Handoff] Gemini triggered low-confidence handoff for user ${senderId}`);
                           
-                          // Notify owner
-                          if (OWNER_PSID && OWNER_PSID !== "your_facebook_user_psid_here") {
+                          // Notify owner (only if owner is not the one chatting)
+                          if (OWNER_PSID && OWNER_PSID !== "your_facebook_user_psid_here" && senderId !== OWNER_PSID) {
                             await sendTextMessage(OWNER_PSID, `⚠️ [Handoff Requested] Gemini requested a human agent for user (PSID: ${senderId}) due to low confidence.\nUser message: "${message.text}"`);
                           }
                         } else if (triggerLeadCapture) {
