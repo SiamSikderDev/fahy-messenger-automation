@@ -8,8 +8,8 @@ COPY package.json ./
 # Install dependencies
 RUN bun install
 
-# Copy source code
-COPY index.js ./
+# Copy all source files
+COPY . .
 
 # Expose port 3000
 EXPOSE 3000
