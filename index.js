@@ -209,7 +209,7 @@ async function handleLeadCaptureFlow(senderId, text, lead) {
 
     // Notify the page owner
     const ownerId = process.env.OWNER_PSID;
-    const notificationText = `🔔 [New Lead Alert]!\nName: ${lead.name}\nPhone: ${lead.phone}\nEmail: ${lead.email}\nSender PSID: ${lead.senderId}`;
+    const notificationText = `🔔 [New Lead Alert]!\nName: ${lead.name}\nPhone: ${lead.phone}\nEmail: ${lead.email}\nConversation: https://business.facebook.com/latest/inbox/people/${lead.senderId}`;
     
     if (ownerId && ownerId !== "your_facebook_user_psid_here" && senderId !== ownerId) {
       console.log(`[Lead Capture] Notifying owner (${ownerId}) of new lead...`);
@@ -324,7 +324,7 @@ Bun.serve({
                         
                         // Notify owner (only if owner is not the one chatting)
                         if (OWNER_PSID && OWNER_PSID !== "your_facebook_user_psid_here" && senderId !== OWNER_PSID) {
-                          await sendTextMessage(OWNER_PSID, `⚠️ [Handoff Requested] User (PSID: ${senderId}) requested a human agent.\nMessage: "${message.text}"`);
+                          await sendTextMessage(OWNER_PSID, `⚠️ [Handoff Requested] User requested a human agent.\nConversation: https://business.facebook.com/latest/inbox/people/${senderId}\nMessage: "${message.text}"`);
                         }
                         continue;
                       }
@@ -389,7 +389,7 @@ Bun.serve({
                           
                           // Notify owner (only if owner is not the one chatting)
                           if (OWNER_PSID && OWNER_PSID !== "your_facebook_user_psid_here" && senderId !== OWNER_PSID) {
-                            await sendTextMessage(OWNER_PSID, `⚠️ [Handoff Requested] Gemini requested a human agent for user (PSID: ${senderId}) due to low confidence.\nUser message: "${message.text}"`);
+                            await sendTextMessage(OWNER_PSID, `⚠️ [Handoff Requested] Gemini requested a human agent due to low confidence.\nConversation: https://business.facebook.com/latest/inbox/people/${senderId}\nUser message: "${message.text}"`);
                           }
                         } else if (triggerLeadCapture) {
                           try {
