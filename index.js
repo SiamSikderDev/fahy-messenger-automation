@@ -2,6 +2,8 @@ import mongoose from "mongoose";
 import Message from "./models/Message.js";
 import Lead from "./models/Lead.js";
 import FAQ from "./models/FAQ.js";
+import ConversationState from "./models/ConversationState.js";
+
 
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "my_secret_token_123";
@@ -111,6 +113,8 @@ async function getGeminiResponse(userText, contextText = "") {
 
 Context:
 ${contextText || "No additional company FAQs found."}
+
+If you have low confidence, if the question is out of scope of professional business communication, if the user asks complex or sensitive questions, or if you cannot answer the query with certainty, answer politely and MUST append '[HUMAN_HANDOFF]' at the very end of your response.
 
 If the user expresses interest in booking a service, hiring us, or asks about pricing, package options, or wants to get started, answer politely to acknowledge, and MUST append '[START_LEAD_CAPTURE]' at the very end of your response. Otherwise, answer their questions normally without appending the tag.`;
 
@@ -260,9 +264,9 @@ Bun.serve({
 
           // Iterate over each entry - there may be multiple if batched
           if (body.entry && Array.isArray(body.entry)) {
-            body.entry.forEach((entry) => {
+            for (const entry of body.entry) {
               if (entry.messaging && Array.isArray(entry.messaging)) {
-                entry.messaging.forEach((webhookEvent) => {
+                for (const webhookEvent of entry.messaging) {
                   const senderId = webhookEvent.sender?.id;
                   const recipientId = webhookEvent.recipient?.id;
                   const message = webhookEvent.message;
@@ -275,81 +279,145 @@ Bun.serve({
                     // Ignore echo messages (sent by the bot itself) to prevent infinite loops
                     if (message.is_echo) {
                       console.log(`- Ignoring echo message.`);
-                      return;
+                      continue;
                     }
 
                     if (message.text) {
                       console.log(`- Text: "${message.text}"`);
 
-                      // Handle lead capture state machine checking
-                      Lead.findOne({ senderId: senderId, status: { $ne: "completed" } }).then(async (activeLead) => {
+                      const textLower = message.text.trim().toLowerCase();
+
+                      // 1. Resume automation if `/bot` command
+                      if (textLower === "/bot") {
+                        await ConversationState.findOneAndUpdate(
+                          { senderId: senderId },
+                          { isHandedOver: false, updatedAt: new Date() },
+                          { upsert: true, new: true }
+                        );
+                        console.log(`[Handoff] Automation resumed for user ${senderId}`);
+                        await sendTextMessage(senderId, "🤖 Automation resumed. How can I help you today?");
+                        continue;
+                      }
+
+                      // 2. Fetch ConversationState
+                      let state = await ConversationState.findOne({ senderId: senderId });
+
+                      // If already handed over, do not respond automatically
+                      if (state && state.isHandedOver) {
+                        console.log(`[Handoff] Conversation is in handed-over state. Ignoring message: "${message.text}"`);
+                        continue;
+                      }
+
+                      // 3. Check for explicit handoff keywords
+                      const handoffKeywords = ["human", "agent", "support"];
+                      const needsHandoff = handoffKeywords.some(keyword => textLower.includes(keyword));
+
+                      if (needsHandoff) {
+                        await ConversationState.findOneAndUpdate(
+                          { senderId: senderId },
+                          { isHandedOver: true, updatedAt: new Date() },
+                          { upsert: true, new: true }
+                        );
+                        console.log(`[Handoff] User requested human. Conversation handed over for ${senderId}`);
+                        
+                        await sendTextMessage(senderId, "I am handing you over to a human agent. They will get back to you shortly.");
+                        
+                        // Notify owner
+                        if (OWNER_PSID && OWNER_PSID !== "your_facebook_user_psid_here") {
+                          await sendTextMessage(OWNER_PSID, `⚠️ [Handoff Requested] User (PSID: ${senderId}) requested a human agent.\nMessage: "${message.text}"`);
+                        }
+                        continue;
+                      }
+
+                      // 4. Handle lead capture state machine checking
+                      try {
+                        const activeLead = await Lead.findOne({ senderId: senderId, status: { $ne: "completed" } });
                         if (activeLead) {
                           await handleLeadCaptureFlow(senderId, message.text, activeLead);
-                          return;
+                          continue;
+                        }
+                      } catch (dbErr) {
+                        console.error(`[MongoDB] Error querying active lead:`, dbErr.message);
+                      }
+
+                      // 5. Retrieve context and then query Gemini API
+                      try {
+                        const contextText = await retrieveContext(message.text);
+                        let aiReply = await getGeminiResponse(message.text, contextText);
+
+                        let finalReply = aiReply;
+                        let triggerLeadCapture = false;
+                        let triggerHandoff = false;
+
+                        // Check for HUMAN_HANDOFF tag
+                        if (aiReply.includes("[HUMAN_HANDOFF]")) {
+                          finalReply = aiReply.replace("[HUMAN_HANDOFF]", "").trim();
+                          triggerHandoff = true;
                         }
 
-                        // Retrieve context and then query Gemini API
-                        retrieveContext(message.text).then((contextText) => {
-                          getGeminiResponse(message.text, contextText).then(async (aiReply) => {
-                            let finalReply = aiReply;
-                            let triggerLeadCapture = false;
+                        if (aiReply.includes("[START_LEAD_CAPTURE]")) {
+                          finalReply = aiReply.replace("[START_LEAD_CAPTURE]", "").trim();
+                          triggerLeadCapture = true;
+                        }
 
-                            if (aiReply.includes("[START_LEAD_CAPTURE]")) {
-                              finalReply = aiReply.replace("[START_LEAD_CAPTURE]", "").trim();
-                              triggerLeadCapture = true;
-                            }
+                        // Send response to the user via Messenger
+                        if (finalReply) {
+                          await sendTextMessage(senderId, finalReply);
+                        }
 
-                            // Send response to the user via Messenger
-                            await sendTextMessage(senderId, finalReply);
-
-                            // Save the conversation details to MongoDB
-                            try {
-                              const conversationLog = new Message({
-                                senderId: senderId,
-                                userMessage: message.text,
-                                aiResponse: finalReply,
-                              });
-                              await conversationLog.save();
-                              console.log(`[MongoDB] Saved message log for user ${senderId}`);
-                            } catch (dbErr) {
-                              console.error(`[MongoDB] Error saving message log:`, dbErr.message);
-                            }
-
-                            // Start lead capture flow if triggered
-                            if (triggerLeadCapture) {
-                              try {
-                                const newLead = new Lead({
-                                  senderId: senderId,
-                                  status: "collecting_name",
-                                });
-                                await newLead.save();
-                                
-                                // Send the first prompt
-                                await sendTextMessage(senderId, "To get started, could you please tell me your full name?");
-                                console.log(`[Lead Capture] Initiated lead flow for user ${senderId}`);
-                              } catch (leadErr) {
-                                console.error(`[Lead Capture] Error initiating lead:`, leadErr.message);
-                              }
-                            }
+                        // Save the conversation details to MongoDB
+                        try {
+                          const conversationLog = new Message({
+                            senderId: senderId,
+                            userMessage: message.text,
+                            aiResponse: finalReply,
                           });
-                        }).catch((ragErr) => {
-                          console.error(`[RAG] Retrieval failed:`, ragErr.message);
-                        });
+                          await conversationLog.save();
+                          console.log(`[MongoDB] Saved message log for user ${senderId}`);
+                        } catch (dbErr) {
+                          console.error(`[MongoDB] Error saving message log:`, dbErr.message);
+                        }
 
-                      }).catch((dbErr) => {
-                        console.error(`[MongoDB] Error querying active lead:`, dbErr.message);
-                      });
+                        // Handle state updates
+                        if (triggerHandoff) {
+                          await ConversationState.findOneAndUpdate(
+                            { senderId: senderId },
+                            { isHandedOver: true, updatedAt: new Date() },
+                            { upsert: true, new: true }
+                          );
+                          console.log(`[Handoff] Gemini triggered low-confidence handoff for user ${senderId}`);
+                          
+                          // Notify owner
+                          if (OWNER_PSID && OWNER_PSID !== "your_facebook_user_psid_here") {
+                            await sendTextMessage(OWNER_PSID, `⚠️ [Handoff Requested] Gemini requested a human agent for user (PSID: ${senderId}) due to low confidence.\nUser message: "${message.text}"`);
+                          }
+                        } else if (triggerLeadCapture) {
+                          try {
+                            const newLead = new Lead({
+                              senderId: senderId,
+                              status: "collecting_name",
+                            });
+                            await newLead.save();
+                            
+                            // Send the first prompt
+                            await sendTextMessage(senderId, "To get started, could you please tell me your full name?");
+                            console.log(`[Lead Capture] Initiated lead flow for user ${senderId}`);
+                          } catch (leadErr) {
+                            console.error(`[Lead Capture] Error initiating lead:`, leadErr.message);
+                          }
+                        }
+                      } catch (ragErr) {
+                        console.error(`[RAG] Retrieval failed:`, ragErr.message);
+                      }
                     }
-
 
                     if (message.attachments) {
                       console.log(`- Attachments: ${JSON.stringify(message.attachments)}`);
                     }
                   }
-
-                });
+                }
               }
-            });
+            }
           }
           console.log(`--------------------------------\n`);
 
