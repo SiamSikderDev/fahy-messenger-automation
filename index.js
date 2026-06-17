@@ -1,11 +1,14 @@
 import mongoose from "mongoose";
 import Message from "./models/Message.js";
+import Lead from "./models/Lead.js";
 
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "my_secret_token_123";
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const MONGODB_URI = process.env.MONGODB_URI;
+const OWNER_PSID = process.env.OWNER_PSID;
+
 
 console.log(`Starting Facebook Messenger Webhook Server...`);
 
@@ -35,9 +38,15 @@ async function getGeminiResponse(userText) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contents: [{ parts: [{ text: userText }] }],
+          systemInstruction: {
+            parts: [{
+              text: "You are an AI assistant for Fahy. If the user expresses interest in booking a service, hiring us, or asks about pricing, package options, or wants to get started, answer politely to acknowledge, and MUST append '[START_LEAD_CAPTURE]' at the very end of your response. Otherwise, answer their questions normally without appending the tag."
+            }]
+          }
         }),
       }
     );
+
 
     const data = await response.json();
     if (response.ok) {
@@ -84,6 +93,47 @@ async function sendTextMessage(recipientId, text) {
     }
   } catch (error) {
     console.error("[Send API] Network error:", error.message);
+  }
+}
+
+
+// Helper function to handle the lead capture questionnaire states
+async function handleLeadCaptureFlow(senderId, text, lead) {
+  if (lead.status === "collecting_name") {
+    lead.name = text.trim();
+    lead.status = "collecting_phone";
+    await lead.save();
+    await sendTextMessage(senderId, `Thank you, ${lead.name}! What is your phone number?`);
+    return;
+  }
+
+  if (lead.status === "collecting_phone") {
+    lead.phone = text.trim();
+    lead.status = "collecting_email";
+    await lead.save();
+    await sendTextMessage(senderId, "Got it! And what is your email address?");
+    return;
+  }
+
+  if (lead.status === "collecting_email") {
+    lead.email = text.trim();
+    lead.status = "completed";
+    await lead.save();
+    
+    await sendTextMessage(senderId, "Thank you! I have saved your details. Our team will get in touch with you shortly.");
+
+    // Notify the page owner
+    const ownerId = process.env.OWNER_PSID;
+    const notificationText = `🔔 [New Lead Alert]!\nName: ${lead.name}\nPhone: ${lead.phone}\nEmail: ${lead.email}\nSender PSID: ${lead.senderId}`;
+    
+    if (ownerId && ownerId !== "your_facebook_user_psid_here") {
+      console.log(`[Lead Capture] Notifying owner (${ownerId}) of new lead...`);
+      await sendTextMessage(ownerId, notificationText);
+    } else {
+      console.log(`[Lead Capture] New Lead captured but OWNER_PSID not configured to send Messenger alert.`);
+      console.log(notificationText);
+    }
+    return;
   }
 }
 
@@ -149,25 +199,62 @@ Bun.serve({
 
                     if (message.text) {
                       console.log(`- Text: "${message.text}"`);
-                      // Query Gemini API and reply with the AI response
-                      getGeminiResponse(message.text).then(async (aiReply) => {
-                        // Send response to the user via Messenger
-                        await sendTextMessage(senderId, aiReply);
 
-                        // Save the conversation details to MongoDB
-                        try {
-                          const conversationLog = new Message({
-                            senderId: senderId,
-                            userMessage: message.text,
-                            aiResponse: aiReply,
-                          });
-                          await conversationLog.save();
-                          console.log(`[MongoDB] Saved message log for user ${senderId}`);
-                        } catch (dbErr) {
-                          console.error(`[MongoDB] Error saving message log:`, dbErr.message);
+                      // Handle lead capture state machine checking
+                      Lead.findOne({ senderId: senderId, status: { $ne: "completed" } }).then(async (activeLead) => {
+                        if (activeLead) {
+                          await handleLeadCaptureFlow(senderId, message.text, activeLead);
+                          return;
                         }
+
+                        // Query Gemini API and reply with the AI response
+                        getGeminiResponse(message.text).then(async (aiReply) => {
+                          let finalReply = aiReply;
+                          let triggerLeadCapture = false;
+
+                          if (aiReply.includes("[START_LEAD_CAPTURE]")) {
+                            finalReply = aiReply.replace("[START_LEAD_CAPTURE]", "").trim();
+                            triggerLeadCapture = true;
+                          }
+
+                          // Send response to the user via Messenger
+                          await sendTextMessage(senderId, finalReply);
+
+                          // Save the conversation details to MongoDB
+                          try {
+                            const conversationLog = new Message({
+                              senderId: senderId,
+                              userMessage: message.text,
+                              aiResponse: finalReply,
+                            });
+                            await conversationLog.save();
+                            console.log(`[MongoDB] Saved message log for user ${senderId}`);
+                          } catch (dbErr) {
+                            console.error(`[MongoDB] Error saving message log:`, dbErr.message);
+                          }
+
+                          // Start lead capture flow if triggered
+                          if (triggerLeadCapture) {
+                            try {
+                              const newLead = new Lead({
+                                senderId: senderId,
+                                status: "collecting_name",
+                              });
+                              await newLead.save();
+                              
+                              // Send the first prompt
+                              await sendTextMessage(senderId, "To get started, could you please tell me your full name?");
+                              console.log(`[Lead Capture] Initiated lead flow for user ${senderId}`);
+                            } catch (leadErr) {
+                              console.error(`[Lead Capture] Error initiating lead:`, leadErr.message);
+                            }
+                          }
+                        });
+                      }).catch((dbErr) => {
+                        console.error(`[MongoDB] Error querying active lead:`, dbErr.message);
                       });
                     }
+
 
                     if (message.attachments) {
                       console.log(`- Attachments: ${JSON.stringify(message.attachments)}`);
