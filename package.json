@@ -6,5 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "bun run index.js"
+  },
+  "dependencies": {
+    "mongoose": "^9.7.0"
   }
 }

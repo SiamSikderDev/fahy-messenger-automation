@@ -1,9 +1,24 @@
+import mongoose from "mongoose";
+import Message from "./models/Message.js";
+
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "my_secret_token_123";
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const MONGODB_URI = process.env.MONGODB_URI;
 
 console.log(`Starting Facebook Messenger Webhook Server...`);
+
+// Connect to MongoDB
+if (MONGODB_URI) {
+  mongoose
+    .connect(MONGODB_URI)
+    .then(() => console.log("[MongoDB] Connected successfully"))
+    .catch((err) => console.error("[MongoDB] Connection error:", err.message));
+} else {
+  console.warn("[MongoDB] Warning: MONGODB_URI environment variable is not defined.");
+}
+
 
 // Helper function to get response from Gemini 1.5 Flash API
 async function getGeminiResponse(userText) {
@@ -135,10 +150,25 @@ Bun.serve({
                     if (message.text) {
                       console.log(`- Text: "${message.text}"`);
                       // Query Gemini API and reply with the AI response
-                      getGeminiResponse(message.text).then((aiReply) => {
-                        sendTextMessage(senderId, aiReply);
+                      getGeminiResponse(message.text).then(async (aiReply) => {
+                        // Send response to the user via Messenger
+                        await sendTextMessage(senderId, aiReply);
+
+                        // Save the conversation details to MongoDB
+                        try {
+                          const conversationLog = new Message({
+                            senderId: senderId,
+                            userMessage: message.text,
+                            aiResponse: aiReply,
+                          });
+                          await conversationLog.save();
+                          console.log(`[MongoDB] Saved message log for user ${senderId}`);
+                        } catch (dbErr) {
+                          console.error(`[MongoDB] Error saving message log:`, dbErr.message);
+                        }
                       });
                     }
+
                     if (message.attachments) {
                       console.log(`- Attachments: ${JSON.stringify(message.attachments)}`);
                     }
