@@ -1,6 +1,7 @@
 import mongoose from "mongoose";
 import Message from "./models/Message.js";
 import Lead from "./models/Lead.js";
+import FAQ from "./models/FAQ.js";
 
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "my_secret_token_123";
@@ -23,12 +24,95 @@ if (MONGODB_URI) {
 }
 
 
-// Helper function to get response from Gemini 1.5 Flash API
-async function getGeminiResponse(userText) {
+// Helper function to get text embedding vector from Gemini API
+async function getEmbedding(text) {
+  if (!GEMINI_API_KEY) {
+    console.error("[Embedding API] Error: GEMINI_API_KEY is not configured.");
+    return null;
+  }
+
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:embedContent?key=${GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          content: { parts: [{ text: text }] },
+        }),
+      }
+    );
+
+    const data = await response.json();
+    if (response.ok) {
+      return data.embedding?.values || null;
+    }
+    console.error("[Embedding API] Failed to get embedding:", JSON.stringify(data));
+  } catch (error) {
+    console.error("[Embedding API] Network error:", error.message);
+  }
+  return null;
+}
+
+// Cosine similarity between two vectors
+function cosineSimilarity(vecA, vecB) {
+  if (!vecA || !vecB || vecA.length !== vecB.length) return 0;
+  let dotProduct = 0.0;
+  let normA = 0.0;
+  let normB = 0.0;
+  for (let i = 0; i < vecA.length; i++) {
+    dotProduct += vecA[i] * vecB[i];
+    normA += vecA[i] * vecA[i];
+    normB += vecB[i] * vecB[i];
+  }
+  if (normA === 0 || normB === 0) return 0;
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+// Retrieve relevant FAQ context
+async function retrieveContext(userText) {
+  const queryEmbedding = await getEmbedding(userText);
+  if (!queryEmbedding) return "";
+
+  try {
+    const faqs = await FAQ.find({});
+    if (faqs.length === 0) return "";
+
+    const scoredFaqs = faqs.map((faq) => {
+      const score = cosineSimilarity(queryEmbedding, faq.embedding);
+      return { question: faq.question, answer: faq.answer, score };
+    });
+
+    // Sort by score descending and filter by a minimum threshold (e.g. 0.6)
+    scoredFaqs.sort((a, b) => b.score - a.score);
+    const relevantFaqs = scoredFaqs.filter((f) => f.score > 0.6).slice(0, 3);
+
+    if (relevantFaqs.length === 0) return "";
+
+    let context = "Relevant Company FAQs:\n";
+    relevantFaqs.forEach((f) => {
+      context += `- Question: ${f.question}\n  Answer: ${f.answer}\n`;
+    });
+    return context;
+  } catch (err) {
+    console.error("[RAG] Error retrieving context:", err.message);
+  }
+  return "";
+}
+
+// Helper function to get response from Gemini API with system instructions and RAG context
+async function getGeminiResponse(userText, contextText = "") {
   if (!GEMINI_API_KEY) {
     console.error("[Gemini API] Error: GEMINI_API_KEY is not configured.");
     return "Sorry, my brain is not configured right now.";
   }
+
+  const systemPrompt = `You are an AI assistant for Fahy. Use the following context to help answer the user's questions if relevant. If the context does not contain the answer, answer politely using your general knowledge about business and professional communication.
+
+Context:
+${contextText || "No additional company FAQs found."}
+
+If the user expresses interest in booking a service, hiring us, or asks about pricing, package options, or wants to get started, answer politely to acknowledge, and MUST append '[START_LEAD_CAPTURE]' at the very end of your response. Otherwise, answer their questions normally without appending the tag.`;
 
   try {
     const response = await fetch(
@@ -39,14 +123,11 @@ async function getGeminiResponse(userText) {
         body: JSON.stringify({
           contents: [{ parts: [{ text: userText }] }],
           systemInstruction: {
-            parts: [{
-              text: "You are an AI assistant for Fahy. If the user expresses interest in booking a service, hiring us, or asks about pricing, package options, or wants to get started, answer politely to acknowledge, and MUST append '[START_LEAD_CAPTURE]' at the very end of your response. Otherwise, answer their questions normally without appending the tag."
-            }]
+            parts: [{ text: systemPrompt }]
           }
         }),
       }
     );
-
 
     const data = await response.json();
     if (response.ok) {
@@ -207,49 +288,54 @@ Bun.serve({
                           return;
                         }
 
-                        // Query Gemini API and reply with the AI response
-                        getGeminiResponse(message.text).then(async (aiReply) => {
-                          let finalReply = aiReply;
-                          let triggerLeadCapture = false;
+                        // Retrieve context and then query Gemini API
+                        retrieveContext(message.text).then((contextText) => {
+                          getGeminiResponse(message.text, contextText).then(async (aiReply) => {
+                            let finalReply = aiReply;
+                            let triggerLeadCapture = false;
 
-                          if (aiReply.includes("[START_LEAD_CAPTURE]")) {
-                            finalReply = aiReply.replace("[START_LEAD_CAPTURE]", "").trim();
-                            triggerLeadCapture = true;
-                          }
-
-                          // Send response to the user via Messenger
-                          await sendTextMessage(senderId, finalReply);
-
-                          // Save the conversation details to MongoDB
-                          try {
-                            const conversationLog = new Message({
-                              senderId: senderId,
-                              userMessage: message.text,
-                              aiResponse: finalReply,
-                            });
-                            await conversationLog.save();
-                            console.log(`[MongoDB] Saved message log for user ${senderId}`);
-                          } catch (dbErr) {
-                            console.error(`[MongoDB] Error saving message log:`, dbErr.message);
-                          }
-
-                          // Start lead capture flow if triggered
-                          if (triggerLeadCapture) {
-                            try {
-                              const newLead = new Lead({
-                                senderId: senderId,
-                                status: "collecting_name",
-                              });
-                              await newLead.save();
-                              
-                              // Send the first prompt
-                              await sendTextMessage(senderId, "To get started, could you please tell me your full name?");
-                              console.log(`[Lead Capture] Initiated lead flow for user ${senderId}`);
-                            } catch (leadErr) {
-                              console.error(`[Lead Capture] Error initiating lead:`, leadErr.message);
+                            if (aiReply.includes("[START_LEAD_CAPTURE]")) {
+                              finalReply = aiReply.replace("[START_LEAD_CAPTURE]", "").trim();
+                              triggerLeadCapture = true;
                             }
-                          }
+
+                            // Send response to the user via Messenger
+                            await sendTextMessage(senderId, finalReply);
+
+                            // Save the conversation details to MongoDB
+                            try {
+                              const conversationLog = new Message({
+                                senderId: senderId,
+                                userMessage: message.text,
+                                aiResponse: finalReply,
+                              });
+                              await conversationLog.save();
+                              console.log(`[MongoDB] Saved message log for user ${senderId}`);
+                            } catch (dbErr) {
+                              console.error(`[MongoDB] Error saving message log:`, dbErr.message);
+                            }
+
+                            // Start lead capture flow if triggered
+                            if (triggerLeadCapture) {
+                              try {
+                                const newLead = new Lead({
+                                  senderId: senderId,
+                                  status: "collecting_name",
+                                });
+                                await newLead.save();
+                                
+                                // Send the first prompt
+                                await sendTextMessage(senderId, "To get started, could you please tell me your full name?");
+                                console.log(`[Lead Capture] Initiated lead flow for user ${senderId}`);
+                              } catch (leadErr) {
+                                console.error(`[Lead Capture] Error initiating lead:`, leadErr.message);
+                              }
+                            }
+                          });
+                        }).catch((ragErr) => {
+                          console.error(`[RAG] Retrieval failed:`, ragErr.message);
                         });
+
                       }).catch((dbErr) => {
                         console.error(`[MongoDB] Error querying active lead:`, dbErr.message);
                       });
