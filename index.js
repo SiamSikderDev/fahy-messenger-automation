@@ -434,6 +434,7 @@ Bun.serve({
       }
 
       // 6. GET /api/dashboard/faqs
+      // 6. GET /api/dashboard/faqs
       if (path === "/api/dashboard/faqs" && req.method === "GET") {
         if (!checkAuth(req)) {
           return new Response(JSON.stringify({ error: "Unauthorized" }), {
@@ -442,12 +443,248 @@ Bun.serve({
           });
         }
         try {
-          const faqs = await FAQ.find({}).select("question answer");
+          const faqs = await FAQ.find({});
           return new Response(JSON.stringify(faqs), {
             headers: { "Content-Type": "application/json" },
           });
         } catch (err) {
           return new Response(JSON.stringify({ error: err.message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+
+      // 7. POST /api/dashboard/faqs (Create)
+      if (path === "/api/dashboard/faqs" && req.method === "POST") {
+        if (!checkAuth(req)) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), {
+            status: 401,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        try {
+          const { question, answer } = await req.json();
+          if (!question || !answer) {
+            return new Response(JSON.stringify({ error: "Question and answer are required" }), {
+              status: 400,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+
+          const embedding = await getEmbedding(question);
+          if (!embedding) {
+            return new Response(JSON.stringify({ error: "Failed to generate embedding from Gemini API" }), {
+              status: 500,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+
+          const newFaq = new FAQ({
+            question,
+            answer,
+            embedding,
+          });
+          await newFaq.save();
+
+          console.log(`[Dashboard] Created FAQ: "${question}"`);
+          return new Response(JSON.stringify(newFaq), {
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err) {
+          return new Response(JSON.stringify({ error: err.message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+
+      // 8. PUT /api/dashboard/faqs/:id (Update)
+      const faqUpdateMatch = path.match(/^\/api\/dashboard\/faqs\/([^/]+)$/);
+      if (faqUpdateMatch && req.method === "PUT") {
+        if (!checkAuth(req)) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), {
+            status: 401,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        const faqId = faqUpdateMatch[1];
+        try {
+          const { question, answer } = await req.json();
+          const faq = await FAQ.findById(faqId);
+          if (!faq) {
+            return new Response(JSON.stringify({ error: "FAQ not found" }), {
+              status: 404,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+
+          if (question && question !== faq.question) {
+            const embedding = await getEmbedding(question);
+            if (!embedding) {
+              return new Response(JSON.stringify({ error: "Failed to regenerate embedding" }), {
+                status: 500,
+                headers: { "Content-Type": "application/json" },
+              });
+            }
+            faq.question = question;
+            faq.embedding = embedding;
+          }
+
+          if (answer) {
+            faq.answer = answer;
+          }
+
+          await faq.save();
+          console.log(`[Dashboard] Updated FAQ ID: ${faqId}`);
+          return new Response(JSON.stringify(faq), {
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err) {
+          return new Response(JSON.stringify({ error: err.message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+
+      // 9. DELETE /api/dashboard/faqs/:id (Delete)
+      const faqDeleteMatch = path.match(/^\/api\/dashboard\/faqs\/([^/]+)$/);
+      if (faqDeleteMatch && req.method === "DELETE") {
+        if (!checkAuth(req)) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), {
+            status: 401,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        const faqId = faqDeleteMatch[1];
+        try {
+          const deletedFaq = await FAQ.findByIdAndDelete(faqId);
+          if (!deletedFaq) {
+            return new Response(JSON.stringify({ error: "FAQ not found" }), {
+              status: 404,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          console.log(`[Dashboard] Deleted FAQ ID: ${faqId}`);
+          return new Response(JSON.stringify({ success: true }), {
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err) {
+          return new Response(JSON.stringify({ error: err.message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+
+      // 10. POST /api/dashboard/faqs/import (File Import)
+      if (path === "/api/dashboard/faqs/import" && req.method === "POST") {
+        if (!checkAuth(req)) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), {
+            status: 401,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        try {
+          const { fileName, content } = await req.json();
+          if (!fileName || !content) {
+            return new Response(JSON.stringify({ error: "Filename and content are required" }), {
+              status: 400,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+
+          let faqsToImport = [];
+
+          if (fileName.toLowerCase().endsWith(".json")) {
+            const parsed = JSON.parse(content);
+            const rawArray = Array.isArray(parsed) ? parsed : (parsed.faqs || []);
+            
+            rawArray.forEach(item => {
+              const q = item.question || item.Question;
+              const a = item.answer || item.Answer;
+              if (q && a) {
+                faqsToImport.push({ question: q, answer: a });
+              }
+            });
+          } else if (fileName.toLowerCase().endsWith(".txt")) {
+            if (!GEMINI_API_KEY) {
+              return new Response(JSON.stringify({ error: "Gemini API key is not configured" }), {
+                status: 500,
+                headers: { "Content-Type": "application/json" },
+              });
+            }
+
+            const prompt = `Extract all relevant business FAQs (Question and Answer pairs) from the following text document. Return the response ONLY as a valid JSON array of objects with "question" and "answer" fields. Do not include markdown formatting, backticks, or wrapping. Just return a raw valid JSON string representing the array. If no FAQs can be extracted, return an empty array [].
+
+Text:
+${content}`;
+
+            const response = await fetch(
+              `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  contents: [{ parts: [{ text: prompt }] }],
+                  generationConfig: {
+                    responseMimeType: "application/json"
+                  }
+                }),
+              }
+            );
+
+            const data = await response.json();
+            if (response.ok) {
+              const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
+              if (reply) {
+                let cleanReply = reply.trim();
+                if (cleanReply.startsWith("```")) {
+                  cleanReply = cleanReply.replace(/^```(json)?/, "").replace(/```$/, "").trim();
+                }
+                faqsToImport = JSON.parse(cleanReply);
+              }
+            } else {
+              throw new Error(`Gemini API error: ${JSON.stringify(data)}`);
+            }
+          } else {
+            return new Response(JSON.stringify({ error: "Unsupported file format. Please upload .json or .txt files." }), {
+              status: 400,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+
+          if (faqsToImport.length === 0) {
+            return new Response(JSON.stringify({ success: true, count: 0, message: "No FAQ items found to import." }), {
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+
+          let successCount = 0;
+          for (const item of faqsToImport) {
+            try {
+              const embedding = await getEmbedding(item.question);
+              if (embedding) {
+                const newFaq = new FAQ({
+                  question: item.question,
+                  answer: item.answer,
+                  embedding: embedding,
+                });
+                await newFaq.save();
+                successCount++;
+              }
+            } catch (err) {
+              console.error(`[Importer] Failed to import FAQ: "${item.question}":`, err.message);
+            }
+          }
+
+          console.log(`[Dashboard] Successfully imported ${successCount} FAQs from ${fileName}`);
+          return new Response(JSON.stringify({ success: true, count: successCount }), {
+            headers: { "Content-Type": "application/json" },
+          });
+        } catch (err) {
+          return new Response(JSON.stringify({ error: `Import failed: ${err.message}` }), {
             status: 500,
             headers: { "Content-Type": "application/json" },
           });
